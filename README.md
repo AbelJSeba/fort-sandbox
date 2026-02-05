@@ -34,14 +34,14 @@ Fort's primary use-case is acting as a security gate in agentic systems: when an
 
 ```bash
 # Clone the repository
-git clone https://github.com/AbelJSeba/sandbox.git
+git clone https://github.com/AbelJSeba/fort-sandbox.git
 cd sandbox
 
 # Build
 go build -o fort ./cmd/fort
 
 # Or install directly
-go install github.com/AbelJSeba/sandbox/cmd/fort@latest
+go install github.com/AbelJSeba/fort-sandbox/cmd/fort@latest
 ```
 
 ### Requirements
@@ -126,16 +126,23 @@ This pattern is suitable for autonomous coding loops, CI/CD agent runners, and o
 
 ## How It Works
 
-Fort uses a 5-phase pipeline:
+Fort uses different pipelines depending on mode:
+
+1. `quick-validate`: static-only checks (no LLM, no container run)
+2. `execute` / `validate`: core 5-phase execution pipeline
+3. `sandbox`: core 5 phases + post-execution LLM artifact review
+4. `report`: dedicated 6-phase analysis/report pipeline
+
+Core execution pipeline (used by `execute` and `validate`, with `sandbox` adding phase 6):
 
 ```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   ANALYZE   │───▶│  SYNTHESIZE │───▶│  VALIDATE   │───▶│    BUILD    │───▶│   EXECUTE   │
-│             │    │             │    │             │    │             │    │             │
-│ LLM detects │    │ LLM generates│   │ Static +    │    │ Docker      │    │ Run in      │
-│ language,   │    │ Dockerfile  │    │ LLM security│    │ image build │    │ isolated    │
-│ deps, entry │    │ & run cmd   │    │ review      │    │             │    │ container   │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│   ANALYZE   │───▶│  SYNTHESIZE │───▶│  VALIDATE   │───▶│    BUILD    │───▶│   EXECUTE   │───▶│   REVIEW    │
+│             │    │             │    │             │    │             │    │             │    │             │
+│ LLM detects │    │ LLM generates│   │ Static +    │    │ Docker      │    │ Run in      │    │ LLM parses  │
+│ language,   │    │ Dockerfile  │    │ LLM security│    │ image build │    │ isolated    │    │ logs/files/ │
+│ deps, entry │    │ & run cmd   │    │ review      │    │             │    │ container   │    │ activity    │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
 ```
 
 ### Phase 1: Analyze
@@ -174,6 +181,21 @@ Runs in isolated container:
 - Read-only filesystem
 - Non-root user
 - Timeout enforcement
+
+### Phase 6: Review (Sandbox Mode)
+`sandbox` mode adds post-execution artifact analysis:
+- LLM parses `stdout` / `stderr`
+- LLM inspects captured `/app/output` files
+- LLM reviews pipeline phases and execution metadata
+- Produces summary, risk level, findings, and recommendations
+
+Report pipeline (`-mode report`) is separate and uses 6 phases:
+1. Code structure analysis
+2. Security assessment
+3. Capability detection
+4. Dependency analysis
+5. Generating recommendations
+6. Summary generation
 
 ## CLI Usage
 
@@ -330,7 +352,7 @@ import (
     "fmt"
     "time"
 
-    "github.com/AbelJSeba/sandbox/pkg/fort"
+    "github.com/AbelJSeba/fort-sandbox/pkg/fort"
 )
 
 func main() {
