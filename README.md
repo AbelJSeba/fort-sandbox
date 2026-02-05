@@ -225,6 +225,17 @@ Results are written to:
 - `logs/fort-run.log` for combined stdout/stderr logs
 - `.fort-llm-dumps/` for raw LLM request/response payloads
 
+Useful passing example (all operations are expected to succeed):
+
+```bash
+./fort -json-out useful-report.json -config examples/fort.sandbox-artifacts.yml -mode sandbox -file examples/useful_sandbox_report.py -purpose "Generate deterministic local analytics report" -verbose -llm-dump-dir .fort-llm-dumps -log-file logs/fort-useful.log
+```
+
+Expected outcome:
+1. No blocked network or privileged-write attempts.
+2. Output artifacts are created under `/app/output`.
+3. LLM review should classify this run as low risk with practical report findings.
+
 ## Library Usage
 
 ```go

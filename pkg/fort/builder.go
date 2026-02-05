@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -168,11 +169,28 @@ func (b *Builder) createBuildContext(req *Request, synthesis *SynthesisResult) (
 
 	// Add source code based on source type
 	switch req.SourceType {
-	case SourceInline:
+	case SourceInline, SourceFile:
 		// Determine filename from language
 		filename := GetSourceFilename(synthesis.BaseImage, synthesis.RunCommand)
-		if err := addToTar(tw, filename, []byte(req.SourceContent)); err != nil {
-			return nil, err
+
+		// Add primary source file plus aliases inferred from Dockerfile COPY sources.
+		candidates := make([]string, 0, 4)
+		candidates = append(candidates, filename)
+		candidates = append(candidates, extractDockerfileCopySources(synthesis.Dockerfile)...)
+
+		seen := make(map[string]struct{})
+		for _, name := range candidates {
+			name = normalizeContextPath(name)
+			if !isSafeContextPath(name) {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			if err := addToTar(tw, name, []byte(req.SourceContent)); err != nil {
+				return nil, err
+			}
 		}
 
 	default:
@@ -187,6 +205,73 @@ func (b *Builder) createBuildContext(req *Request, synthesis *SynthesisResult) (
 	}
 
 	return &buf, nil
+}
+
+func extractDockerfileCopySources(dockerfile string) []string {
+	lines := strings.Split(dockerfile, "\n")
+	out := make([]string, 0, 4)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToUpper(trimmed), "COPY ") {
+			continue
+		}
+
+		parts := strings.Fields(trimmed)
+		if len(parts) < 3 {
+			continue
+		}
+
+		// Skip directive and optional flags.
+		args := parts[1:]
+		start := 0
+		for start < len(args) && strings.HasPrefix(args[start], "--") {
+			start++
+		}
+		if len(args)-start < 2 {
+			continue
+		}
+
+		// COPY src... dst -> all except last token are sources.
+		sources := args[start : len(args)-1]
+		for _, src := range sources {
+			src = strings.Trim(src, "\"'")
+			src = normalizeContextPath(src)
+			if src == "" {
+				continue
+			}
+			// Skip globs and directories; we only alias direct files.
+			if strings.ContainsAny(src, "*?[]") || strings.HasSuffix(src, "/") {
+				continue
+			}
+			out = append(out, src)
+		}
+	}
+	return out
+}
+
+func normalizeContextPath(path string) string {
+	path = strings.TrimSpace(path)
+	path = strings.Trim(path, "\"'")
+	path = strings.ReplaceAll(path, "\\", "/")
+	path = strings.TrimPrefix(path, "./")
+	return path
+}
+
+func isSafeContextPath(path string) bool {
+	if path == "" {
+		return false
+	}
+	if strings.HasPrefix(path, "/") {
+		return false
+	}
+	clean := filepath.ToSlash(filepath.Clean(path))
+	if clean == "." || strings.HasPrefix(clean, "../") || clean == ".." {
+		return false
+	}
+	return true
 }
 
 // addToTar adds a file to a tar archive
