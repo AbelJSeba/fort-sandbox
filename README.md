@@ -63,38 +63,8 @@ export DEEPSEEK_API_KEY=sk-...         # DeepSeek
 export TOGETHER_API_KEY=...            # Together AI
 export GROQ_API_KEY=gsk_...            # Groq
 
-# Execute Python code
-./fort -code 'print("Hello, World!")'
-
-# Execute from file
-./fort -file script.py
-
-# Use a specific provider
-./fort -provider deepseek -model deepseek-coder -code 'print("Hello!")'
-
-# Analyze without executing
-./fort -mode analyze -file main.go
-
-# Full sandbox flow + LLM artifact review
-./fort -mode sandbox -file script.py -verbose
-
-# Sandbox flow with raw LLM request/response dumps
-./fort -mode sandbox -file script.py -verbose -llm-dump-dir .fort-llm-dumps
-
-# Write JSON result directly to file
-./fort -json -mode sandbox -file script.py -json-out reports/sandbox.json
-
-# Save full CLI output (stdout+stderr) to a log file
-./fort -mode sandbox -file script.py -verbose -log-file logs/fort-run.log
-
-# Epic showcase workload (strict sandbox defaults)
-./fort -mode sandbox -file examples/epic_sandbox_showcase.py -purpose "Epic sandbox demo" -verbose
-
-# Quick security check (no LLM needed)
-./fort -mode quick-validate -code 'import os; os.system("rm -rf /")'
-
-# List available providers
-./fort -list-providers
+# Canonical sandbox example (LLM review + JSON output + logs + dumps)
+./fort -json-out report.json -config examples/fort.sandbox-artifacts.yml -mode sandbox -file examples/epic_sandbox_showcase.py -purpose "Artifact-rich sandbox demo" -verbose -llm-dump-dir .fort-llm-dumps -log-file logs/fort-run.log
 ```
 
 ## Main Use-Case: Agent-Generated Code Validation
@@ -106,21 +76,7 @@ Use Fort between "code-writing agents" and your real infrastructure:
 3. Run `sandbox` for full LLM analysis + isolated execution + artifact review.
 4. Inspect JSON/log outputs and decide whether to promote, reject, or request revision.
 
-Example flow:
-
-```bash
-# 1) Fast static gate
-./fort -mode quick-validate -file proposed_script.py
-
-# 2) Full gated execution with machine-readable outputs
-./fort -mode sandbox \
-  -file proposed_script.py \
-  -purpose "Agent proposed patch validation" \
-  -json \
-  -json-out reports/proposed_script.sandbox.json \
-  -log-file logs/proposed_script.sandbox.log \
-  -verbose
-```
+Use the Quick Start command above as the default gated execution run.
 
 This pattern is suitable for autonomous coding loops, CI/CD agent runners, and orchestrators that execute untrusted or semi-trusted agent output.
 
@@ -257,90 +213,17 @@ Output:
 
 ## Examples
 
-### Execute Python Script
-```bash
-./fort -file examples/hello.py
-```
-
-### Execute with Network Access
-```bash
-./fort -code 'import requests; print(requests.get("https://api.github.com").status_code)' \
-       -allow-network
-```
-
-### Analyze a Go Project
-```bash
-./fort -mode analyze -file main.go -purpose "HTTP server"
-```
-
-### Security Validation Only
-```bash
-./fort -mode validate -file untrusted_script.py
-```
-
-### Full Sandbox Pipeline with LLM Result Analysis
-```bash
-./fort -mode sandbox -file untrusted_script.py -verbose
-```
-
-This mode runs:
-1. LLM code analysis
-2. Container synthesis/build
-3. Sandboxed execution
-4. LLM parsing of execution artifacts:
-   logs (`stdout`/`stderr`), output files captured from `/app/output`, and pipeline activity/phases
-
-### Epic Sandbox Showcase
-Run the included showcase script:
-
-```bash
-./fort -mode sandbox \
-  -file examples/epic_sandbox_showcase.py \
-  -purpose "Demonstrate sandbox controls and post-exec LLM review" \
-  -verbose
-```
-
-For artifact-heavy output file parsing (in addition to logs/activity), use:
-
-```bash
-./fort -config examples/fort.sandbox-artifacts.yml \
-  -mode sandbox \
-  -file examples/epic_sandbox_showcase.py \
-  -purpose "Artifact-rich sandbox demo" \
-  -verbose
-```
+Use the same Quick Start command.
 
 What to expect:
 1. Normal compute succeeds.
 2. Network attempt is blocked when `allow_network=false`.
 3. Privileged write attempt (`/etc/...`) is denied.
 4. LLM result analysis summarizes pipeline phases, logs, output files, and security implications.
-
-### Quick Static Check (No API Key Needed)
-```bash
-./fort -mode quick-validate -code 'eval(input())'
-# Output: ❌ UNSAFE - Security issues detected
-#   1. 🟠 [high] Code injection via eval
-```
-
-### JSON Output for Automation
-```bash
-./fort -json -file script.py | jq '.result.stdout'
-```
-
-Write JSON directly to a file:
-```bash
-./fort -json -mode sandbox -file script.py -json-out reports/sandbox.json
-./fort -mode report -file script.py -json-out reports/report.json
-```
-
-Capture logs to a file:
-```bash
-./fort -mode sandbox -file script.py -verbose -log-file logs/fort-run.log
-```
-
-When running `execute`, `sandbox`, or verbose `report`, Fort shows a live phase progress bar.
-In `-json -verbose` mode, progress and debug logs go to `stderr`, while JSON stays clean on `stdout` (or `-json-out`).
+Results are written to:
+- `report.json` for machine-readable output
+- `logs/fort-run.log` for combined stdout/stderr logs
+- `.fort-llm-dumps/` for raw LLM request/response payloads
 
 ## Library Usage
 
