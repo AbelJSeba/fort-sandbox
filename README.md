@@ -25,6 +25,7 @@ Fort is an intelligent code execution sandbox that combines LLM-powered analysis
 - **Multi-File Projects** - Supports zip/tar archives with automatic project structure analysis
 - **Defense in Depth** - Multiple validation layers before execution
 - **15+ Languages** - Python, JavaScript, TypeScript, Go, Rust, Java, C/C++, PHP, Ruby, and more
+- **Multiple LLM Providers** - OpenAI, OpenRouter, DeepSeek, Together, Groq, Ollama (local)
 
 ## Installation
 
@@ -44,13 +45,20 @@ go install github.com/AbelJSeba/sandbox/cmd/fort@latest
 
 - Go 1.22+
 - Docker (for container execution)
-- OpenAI API key (for LLM analysis)
+- LLM API key (OpenAI, OpenRouter, DeepSeek, Together, Groq, or local Ollama)
 
 ## Quick Start
 
 ```bash
-# Set your OpenAI API key
-export OPENAI_API_KEY=your-key-here
+# Initialize config file (optional)
+./fort -mode init-config
+
+# Set your API key (choose one)
+export OPENAI_API_KEY=sk-...           # OpenAI
+export OPENROUTER_API_KEY=sk-or-...    # OpenRouter
+export DEEPSEEK_API_KEY=sk-...         # DeepSeek
+export TOGETHER_API_KEY=...            # Together AI
+export GROQ_API_KEY=gsk_...            # Groq
 
 # Execute Python code
 ./fort -code 'print("Hello, World!")'
@@ -58,11 +66,17 @@ export OPENAI_API_KEY=your-key-here
 # Execute from file
 ./fort -file script.py
 
+# Use a specific provider
+./fort -provider deepseek -model deepseek-coder -code 'print("Hello!")'
+
 # Analyze without executing
 ./fort -mode analyze -file main.go
 
 # Quick security check (no LLM needed)
 ./fort -mode quick-validate -code 'import os; os.system("rm -rf /")'
+
+# List available providers
+./fort -list-providers
 ```
 
 ## How It Works
@@ -121,9 +135,11 @@ Runs in isolated container:
 ```
 Usage: fort [options]
 
-Options:
+Modes:
   -mode string
-        Mode: execute, analyze, validate, quick-validate (default "execute")
+        Mode: execute, analyze, validate, quick-validate, init-config (default "execute")
+
+Input:
   -file string
         Path to code file (or - for stdin)
   -code string
@@ -132,20 +148,38 @@ Options:
         Language hint (python, go, js, etc.)
   -purpose string
         Description of what the code should do
+
+LLM Provider:
+  -provider string
+        LLM provider: openai, openrouter, deepseek, together, groq, ollama
+  -model string
+        LLM model to use (provider-specific)
+  -base-url string
+        Custom LLM API base URL
+  -config string
+        Path to config file (default: auto-detect)
+  -list-providers
+        List available LLM providers
+
+Execution:
   -timeout int
-        Execution timeout in seconds (default 60)
+        Execution timeout in seconds (0 = use config default)
   -memory int
-        Memory limit in MB (default 256)
+        Memory limit in MB (0 = use config default)
   -allow-network
         Allow network access (default: disabled)
   -no-validate
         Skip security validation (DANGEROUS)
+
+Output:
   -json
         Output results as JSON
   -verbose
         Verbose output
-  -model string
-        LLM model to use (default "gpt-4")
+  -banner
+        Show banner (default: true)
+  -version
+        Show version
 ```
 
 ## Examples
@@ -304,14 +338,93 @@ fmt.Println(result.Dockerfile)
 
 ## Configuration
 
+### Config File
+
+Fort looks for configuration in these locations (in order):
+1. `./fort.yml` or `./fort.yaml`
+2. `./.fort.yml` or `./.fort.yaml`
+3. `~/.config/fort/config.yml`
+4. `~/.fort.yml`
+
+Generate an example config:
+```bash
+./fort -mode init-config
+```
+
+Example `fort.yml`:
+```yaml
+# LLM Provider Configuration
+llm:
+  provider: openai              # openai, openrouter, deepseek, together, groq, ollama
+  model: gpt-4                  # Provider-specific model name
+  # api_key: sk-...             # Optional: can use environment variables
+  # base_url: https://...       # Optional: custom endpoint
+  temperature: 0.1
+
+# Execution Defaults
+execution:
+  timeout_sec: 60
+  memory_mb: 256
+  cpu_limit: 1.0
+  max_pids: 100
+
+# Security Policy
+security:
+  allow_network: false
+  allow_file_write: false
+  require_validate: true
+
+# Docker Configuration
+docker:
+  build_timeout: "5m"
+  no_cache: false
+```
+
+### LLM Providers
+
+| Provider | Environment Variable | Models |
+|----------|---------------------|--------|
+| OpenAI | `OPENAI_API_KEY` | gpt-4, gpt-4-turbo, gpt-4o, gpt-3.5-turbo |
+| OpenRouter | `OPENROUTER_API_KEY` | anthropic/claude-3-opus, openai/gpt-4-turbo, etc. |
+| DeepSeek | `DEEPSEEK_API_KEY` | deepseek-chat, deepseek-coder |
+| Together | `TOGETHER_API_KEY` | meta-llama/Llama-3-70b-chat-hf, etc. |
+| Groq | `GROQ_API_KEY` | llama-3.1-70b-versatile, mixtral-8x7b-32768 |
+| Ollama | (none - local) | llama3, codellama, mistral |
+
+#### Using DeepSeek (cost-effective)
+```bash
+export DEEPSEEK_API_KEY=sk-...
+./fort -provider deepseek -model deepseek-coder -code 'print("Hello!")'
+```
+
+#### Using OpenRouter (access to many models)
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+./fort -provider openrouter -model anthropic/claude-3-sonnet -code 'print("Hello!")'
+```
+
+#### Using Ollama (local, free)
+```bash
+# Start Ollama first: ollama serve
+./fort -provider ollama -model llama3 -code 'print("Hello!")'
+```
+
 ### Environment Variables
 
 ```bash
-OPENAI_API_KEY=sk-...        # Required for LLM analysis
-OPENAI_MODEL=gpt-4           # Model to use (default: gpt-4)
+# Provider-specific API keys
+OPENAI_API_KEY=sk-...
+OPENROUTER_API_KEY=sk-or-...
+DEEPSEEK_API_KEY=sk-...
+TOGETHER_API_KEY=...
+GROQ_API_KEY=gsk_...
+
+# Generic fallbacks
+FORT_API_KEY=...               # Used if provider-specific key not found
+LLM_API_KEY=...                # Alternative generic key
 ```
 
-### Security Policy
+### Security Policy (Library)
 
 ```go
 policy := fort.SecurityPolicy{
@@ -341,7 +454,9 @@ fort-sandbox/
 │   ├── executor.go       # Container execution
 │   ├── project.go        # Multi-file project support
 │   ├── llm.go            # LLM client abstraction
+│   ├── config.go         # Configuration & providers
 │   └── types.go          # Domain types
+├── fort.example.yml      # Example configuration
 ├── go.mod
 ├── go.sum
 └── README.md

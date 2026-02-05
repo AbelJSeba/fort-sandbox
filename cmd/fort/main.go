@@ -13,6 +13,8 @@ import (
 	"github.com/AbelJSeba/sandbox/pkg/fort"
 )
 
+var version = "dev"
+
 const banner = `
 ╔═══════════════════════════════════════════════════════════════════╗
 ║                                                                   ║
@@ -30,29 +32,94 @@ const banner = `
 
 func main() {
 	var (
-		mode       = flag.String("mode", "execute", "Mode: execute, analyze, validate, quick-validate")
-		file       = flag.String("file", "", "Path to code file (or - for stdin)")
-		code       = flag.String("code", "", "Inline code to execute")
-		lang       = flag.String("lang", "", "Language hint (python, go, js, etc.)")
-		purpose    = flag.String("purpose", "", "Description of what the code should do")
-		timeout    = flag.Int("timeout", 60, "Execution timeout in seconds")
-		memoryMB   = flag.Int("memory", 256, "Memory limit in MB")
-		allowNet   = flag.Bool("allow-network", false, "Allow network access")
-		jsonOutput = flag.Bool("json", false, "Output results as JSON")
-		noValidate = flag.Bool("no-validate", false, "Skip security validation (DANGEROUS)")
-		verbose    = flag.Bool("verbose", false, "Verbose output")
-		llmModel   = flag.String("model", "gpt-4", "LLM model to use")
-		showBanner = flag.Bool("banner", true, "Show banner")
+		mode         = flag.String("mode", "execute", "Mode: execute, analyze, validate, quick-validate, init-config")
+		file         = flag.String("file", "", "Path to code file (or - for stdin)")
+		code         = flag.String("code", "", "Inline code to execute")
+		lang         = flag.String("lang", "", "Language hint (python, go, js, etc.)")
+		purpose      = flag.String("purpose", "", "Description of what the code should do")
+		timeout      = flag.Int("timeout", 0, "Execution timeout in seconds (0 = use config)")
+		memoryMB     = flag.Int("memory", 0, "Memory limit in MB (0 = use config)")
+		allowNet     = flag.Bool("allow-network", false, "Allow network access")
+		jsonOutput   = flag.Bool("json", false, "Output results as JSON")
+		noValidate   = flag.Bool("no-validate", false, "Skip security validation (DANGEROUS)")
+		verbose      = flag.Bool("verbose", false, "Verbose output")
+		showBanner   = flag.Bool("banner", true, "Show banner")
+		showVersion  = flag.Bool("version", false, "Show version")
+		configFile   = flag.String("config", "", "Path to config file (default: auto-detect)")
+		llmProvider  = flag.String("provider", "", "LLM provider: openai, openrouter, deepseek, together, groq, ollama")
+		llmModel     = flag.String("model", "", "LLM model to use")
+		llmBaseURL   = flag.String("base-url", "", "Custom LLM API base URL")
+		listProviders = flag.Bool("list-providers", false, "List available LLM providers")
 	)
 	flag.Parse()
 
-	if *showBanner && !*jsonOutput {
+	if *showVersion {
+		fmt.Printf("Fort %s\n", version)
+		return
+	}
+
+	if *showBanner && !*jsonOutput && *mode != "init-config" && !*listProviders {
 		fmt.Print(banner)
 	}
 
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		fatal("OPENAI_API_KEY environment variable not set")
+	if *listProviders {
+		printProviders()
+		return
+	}
+
+	// Handle init-config mode
+	if *mode == "init-config" {
+		initConfig(*configFile)
+		return
+	}
+
+	// Load configuration
+	var cfg *fort.Config
+	var err error
+	if *configFile != "" {
+		cfg, err = fort.LoadConfig(*configFile)
+		if err != nil {
+			fatal("Failed to load config: %v", err)
+		}
+	} else {
+		cfg, err = fort.LoadConfigFromDefaultPaths()
+		if err != nil {
+			fatal("Failed to load config: %v", err)
+		}
+	}
+
+	// Override config with CLI flags
+	if *llmProvider != "" {
+		cfg.LLM.Provider = *llmProvider
+	}
+	if *llmModel != "" {
+		cfg.LLM.Model = *llmModel
+	}
+	if *llmBaseURL != "" {
+		cfg.LLM.BaseURL = *llmBaseURL
+	}
+	if *timeout > 0 {
+		cfg.Execution.TimeoutSec = *timeout
+	}
+	if *memoryMB > 0 {
+		cfg.Execution.MemoryMB = *memoryMB
+	}
+	if *allowNet {
+		cfg.Security.AllowNetwork = true
+	}
+	if *noValidate {
+		cfg.Security.RequireValidate = false
+	}
+
+	// Resolve API key
+	apiKey := cfg.ResolveAPIKey()
+	if apiKey == "" && *mode != "quick-validate" {
+		providerInfo := fort.KnownProviders[cfg.LLM.Provider]
+		envHint := "OPENAI_API_KEY"
+		if providerInfo.EnvKey != "" {
+			envHint = providerInfo.EnvKey
+		}
+		fatal("No API key found. Set %s environment variable or add api_key to config file", envHint)
 	}
 
 	sourceCode, err := getSourceCode(*file, *code)
@@ -60,17 +127,22 @@ func main() {
 		fatal("Failed to get source code: %v", err)
 	}
 
-	if sourceCode == "" {
+	if sourceCode == "" && *mode != "init-config" {
 		flag.Usage()
 		fatal("No code provided. Use -file or -code")
 	}
 
-	config := fort.DefaultAgentConfig()
-	config.LLMModel = *llmModel
-	config.LLMAPIKey = apiKey
-	config.RequireValidation = !*noValidate
+	// Convert config to agent config
+	agentConfig := cfg.ToAgentConfig()
 
-	agent, err := fort.NewAgent(config)
+	if *verbose {
+		fmt.Printf("Provider: %s\n", cfg.LLM.Provider)
+		fmt.Printf("Model: %s\n", cfg.ResolveModel())
+		fmt.Printf("Base URL: %s\n", cfg.ResolveBaseURL())
+		fmt.Println()
+	}
+
+	agent, err := fort.NewAgent(agentConfig)
 	if err != nil {
 		fatal("Failed to create agent: %v", err)
 	}
@@ -417,4 +489,48 @@ func fatal(format string, args ...interface{}) {
 
 func generateID() string {
 	return fmt.Sprintf("exec_%d", time.Now().UnixNano())
+}
+
+func printProviders() {
+	fmt.Println("Available LLM Providers:")
+	fmt.Println()
+	for id, p := range fort.KnownProviders {
+		fmt.Printf("  %s (%s)\n", id, p.Name)
+		fmt.Printf("    Base URL: %s\n", p.BaseURL)
+		if p.EnvKey != "" {
+			fmt.Printf("    Env Key:  %s\n", p.EnvKey)
+		}
+		fmt.Printf("    Models:   %s\n", strings.Join(p.Models, ", "))
+		fmt.Printf("    Default:  %s\n", p.DefaultModel)
+		fmt.Println()
+	}
+}
+
+func initConfig(path string) {
+	if path == "" {
+		path = "fort.yml"
+	}
+
+	// Check if file already exists
+	if _, err := os.Stat(path); err == nil {
+		fmt.Printf("Config file already exists: %s\n", path)
+		fmt.Println("Remove it first or specify a different path with -config")
+		os.Exit(1)
+	}
+
+	content := fort.GenerateExampleConfig()
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		fatal("Failed to write config file: %v", err)
+	}
+
+	fmt.Printf("Created config file: %s\n", path)
+	fmt.Println()
+	fmt.Println("Next steps:")
+	fmt.Println("  1. Edit the config file to set your preferred provider and API key")
+	fmt.Println("  2. Or set the appropriate environment variable:")
+	fmt.Println("     - OpenAI:     export OPENAI_API_KEY=sk-...")
+	fmt.Println("     - OpenRouter: export OPENROUTER_API_KEY=sk-or-...")
+	fmt.Println("     - DeepSeek:   export DEEPSEEK_API_KEY=sk-...")
+	fmt.Println("     - Together:   export TOGETHER_API_KEY=...")
+	fmt.Println("     - Groq:       export GROQ_API_KEY=gsk_...")
 }

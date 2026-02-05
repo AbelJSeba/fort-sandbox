@@ -24,10 +24,11 @@ type ExecutorConfig struct {
 	Runtime          string        // runc, runsc (gVisor), kata
 	DefaultMemoryMB  int
 	DefaultCPU       float64
-	DefaultTimeout   time.Duration
+	DefaultTimeout   int           // seconds
 	MaxMemoryMB      int
 	MaxCPU           float64
 	MaxTimeout       time.Duration
+	MaxPIDs          int           // Maximum number of processes
 	ReadOnlyRootfs   bool
 	NoNewPrivileges  bool
 	DropCapabilities []string
@@ -41,10 +42,11 @@ func DefaultExecutorConfig() ExecutorConfig {
 		Runtime:          "runc",
 		DefaultMemoryMB:  256,
 		DefaultCPU:       1.0,
-		DefaultTimeout:   60 * time.Second,
+		DefaultTimeout:   60,
 		MaxMemoryMB:      512,
 		MaxCPU:           2.0,
 		MaxTimeout:       5 * time.Minute,
+		MaxPIDs:          100,
 		ReadOnlyRootfs:   true,
 		NoNewPrivileges:  true,
 		NetworkDisabled:  true,
@@ -103,7 +105,7 @@ func (e *Executor) Execute(ctx context.Context, req *Request, synthesis *Synthes
 		Resources: container.Resources{
 			Memory:    int64(memoryMB) * 1024 * 1024,
 			NanoCPUs:  int64(cpu * 1e9),
-			PidsLimit: ptrInt64(100), // Prevent fork bombs
+			PidsLimit: ptrInt64(int64(e.config.MaxPIDs)), // Prevent fork bombs
 		},
 		ReadonlyRootfs: e.config.ReadOnlyRootfs && !policy.AllowFileWrite,
 		SecurityOpt: []string{
@@ -306,7 +308,7 @@ func (e *Executor) clampCPU(recommended, requestMax float64) float64 {
 func (e *Executor) clampTimeout(recommendedSec, requestMaxSec int) time.Duration {
 	recommended := time.Duration(recommendedSec) * time.Second
 	if recommended <= 0 {
-		recommended = e.config.DefaultTimeout
+		recommended = time.Duration(e.config.DefaultTimeout) * time.Second
 	}
 	requestMax := time.Duration(requestMaxSec) * time.Second
 	if requestMax > 0 && recommended > requestMax {

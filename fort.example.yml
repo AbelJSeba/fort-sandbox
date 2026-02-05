@@ -1,0 +1,90 @@
+# Fort Configuration File
+# Copy this to fort.yml, ~/.config/fort/config.yml, or ~/.fort.yml
+
+# LLM Provider Configuration
+llm:
+  # Provider: openai, openrouter, deepseek, together, groq, ollama, or custom
+  provider: openai
+
+  # Model name (provider-specific)
+  # OpenAI: gpt-4, gpt-4-turbo, gpt-4o, gpt-3.5-turbo
+  # OpenRouter: anthropic/claude-3-opus, openai/gpt-4-turbo, etc.
+  # DeepSeek: deepseek-chat, deepseek-coder
+  # Together: meta-llama/Llama-3-70b-chat-hf
+  # Groq: llama-3.1-70b-versatile
+  # Ollama: llama3, codellama, mistral
+  model: gpt-4
+
+  # API key (optional - can use environment variables instead)
+  # Environment variables checked: OPENAI_API_KEY, OPENROUTER_API_KEY,
+  # DEEPSEEK_API_KEY, TOGETHER_API_KEY, GROQ_API_KEY, FORT_API_KEY
+  # api_key: sk-your-api-key-here
+
+  # Custom base URL (optional - for self-hosted or proxy endpoints)
+  # base_url: https://api.example.com/v1
+
+  # Temperature for LLM responses (0.0-1.0, lower = more deterministic)
+  temperature: 0.1
+
+# Execution Defaults
+execution:
+  timeout_sec: 60      # Maximum execution time
+  memory_mb: 256       # Memory limit
+  cpu_limit: 1.0       # CPU cores limit
+  max_pids: 100        # Maximum processes
+
+# Security Policy
+security:
+  allow_network: false    # Allow network access in containers
+  allow_file_write: false # Allow writing to filesystem
+  require_validate: true  # Run security validation before execution
+  # blocked_patterns:     # Additional patterns to block
+  #   - "crypto.*mine"
+  #   - "botnet"
+
+# Docker Configuration
+docker:
+  build_timeout: "5m"   # Docker build timeout
+  no_cache: false       # Disable Docker build cache
+  # runtime: ""         # Alternative runtime (e.g., runsc for gVisor)
+
+# =============================================================================
+# Provider-Specific Examples
+# =============================================================================
+
+# --- OpenRouter (access to multiple providers) ---
+# llm:
+#   provider: openrouter
+#   model: anthropic/claude-3-sonnet
+#   # Set OPENROUTER_API_KEY environment variable
+
+# --- DeepSeek (cost-effective coding assistant) ---
+# llm:
+#   provider: deepseek
+#   model: deepseek-coder
+#   # Set DEEPSEEK_API_KEY environment variable
+
+# --- Together AI (open-source models) ---
+# llm:
+#   provider: together
+#   model: meta-llama/Llama-3-70b-chat-hf
+#   # Set TOGETHER_API_KEY environment variable
+
+# --- Groq (fast inference) ---
+# llm:
+#   provider: groq
+#   model: llama-3.1-70b-versatile
+#   # Set GROQ_API_KEY environment variable
+
+# --- Ollama (local, no API key needed) ---
+# llm:
+#   provider: ollama
+#   model: llama3
+#   base_url: http://localhost:11434/v1
+
+# --- Custom/Self-hosted OpenAI-compatible API ---
+# llm:
+#   provider: custom
+#   model: your-model-name
+#   base_url: https://your-api.example.com/v1
+#   api_key: your-api-key
