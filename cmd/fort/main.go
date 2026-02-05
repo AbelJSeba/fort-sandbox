@@ -7,13 +7,21 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AbelJSeba/sandbox/pkg/fort"
 )
 
 var version = "dev"
+var jsonOutputPath string
+var outputCleanup func()
+var interactiveStdout bool
+var colorStdout bool
+var interactiveStderr bool
+var colorStderr bool
 
 const banner = `
 ╔═══════════════════════════════════════════════════════════════════╗
@@ -41,6 +49,8 @@ func main() {
 		memoryMB      = flag.Int("memory", 0, "Memory limit in MB (0 = use config)")
 		allowNet      = flag.Bool("allow-network", false, "Allow network access")
 		jsonOutput    = flag.Bool("json", false, "Output results as JSON")
+		jsonOutPath   = flag.String("json-out", "", "Write JSON output to file")
+		logFilePath   = flag.String("log-file", "", "Write combined stdout/stderr logs to file")
 		noValidate    = flag.Bool("no-validate", false, "Skip security validation (DANGEROUS)")
 		verbose       = flag.Bool("verbose", false, "Verbose output")
 		showBanner    = flag.Bool("banner", true, "Show banner")
@@ -53,6 +63,19 @@ func main() {
 		listProviders = flag.Bool("list-providers", false, "List available LLM providers")
 	)
 	flag.Parse()
+	jsonOutputPath = strings.TrimSpace(*jsonOutPath)
+	interactiveStdout = detectInteractiveTerminal(os.Stdout)
+	interactiveStderr = detectInteractiveTerminal(os.Stderr)
+	noColor := strings.TrimSpace(os.Getenv("NO_COLOR")) != ""
+	colorStdout = interactiveStdout && !noColor
+	colorStderr = interactiveStderr && !noColor
+
+	var err error
+	outputCleanup, err = setupOutputTee(strings.TrimSpace(*logFilePath))
+	if err != nil {
+		fatal("Failed to setup log file: %v", err)
+	}
+	defer outputCleanup()
 
 	if *showVersion {
 		fmt.Printf("Fort %s\n", version)
@@ -76,7 +99,6 @@ func main() {
 
 	// Load configuration
 	var cfg *fort.Config
-	var err error
 	if *configFile != "" {
 		cfg, err = fort.LoadConfig(*configFile)
 		if err != nil {
@@ -144,10 +166,16 @@ func main() {
 	agentConfig := cfg.ToAgentConfig()
 	agentConfig.Verbose = *verbose
 
-	if *verbose {
+	if *verbose && !*jsonOutput {
 		fmt.Printf("Provider: %s\n", cfg.LLM.Provider)
 		fmt.Printf("Model: %s\n", cfg.ResolveModel())
 		fmt.Printf("Base URL: %s\n", cfg.ResolveBaseURL())
+		if jsonOutputPath != "" {
+			fmt.Printf("JSON out: %s\n", jsonOutputPath)
+		}
+		if strings.TrimSpace(*logFilePath) != "" {
+			fmt.Printf("Log file: %s\n", strings.TrimSpace(*logFilePath))
+		}
 		if cfg.LLM.DumpDir != "" {
 			fmt.Printf("LLM dump dir: %s\n", cfg.LLM.DumpDir)
 		}
@@ -202,7 +230,7 @@ func main() {
 		runAnalyze(ctx, agent, req, *verbose, *jsonOutput)
 
 	case "execute":
-		runExecute(ctx, agent, req, *verbose, *jsonOutput)
+		runExecute(ctx, agent, req, *verbose, *jsonOutput, agentConfig.RequireValidation)
 
 	default:
 		fatal("Unknown mode: %s", *mode)
@@ -256,7 +284,9 @@ func modeRequiresSourceCode(mode string) bool {
 }
 
 func runQuickValidate(agent *fort.Agent, code string, jsonOutput bool) {
-	fmt.Println("\n[Quick Validation] Running static analysis...")
+	if !jsonOutput {
+		fmt.Println("\n[Quick Validation] Running static analysis...")
+	}
 
 	safe, findings := agent.QuickValidate(code, nil)
 
@@ -291,12 +321,14 @@ func runQuickValidate(agent *fort.Agent, code string, jsonOutput bool) {
 	}
 
 	if !safe {
-		os.Exit(1)
+		exitWithCode(1)
 	}
 }
 
 func runValidate(ctx context.Context, agent *fort.Agent, req *fort.Request, verbose, jsonOutput bool) {
-	fmt.Println("\n[Validation] Running full security validation...")
+	if !jsonOutput {
+		fmt.Println("\n[Validation] Running full security validation...")
+	}
 
 	result, err := agent.Validate(ctx, req)
 	if err != nil {
@@ -345,12 +377,14 @@ func runValidate(ctx context.Context, agent *fort.Agent, req *fort.Request, verb
 	}
 
 	if !result.Safe {
-		os.Exit(1)
+		exitWithCode(1)
 	}
 }
 
 func runAnalyze(ctx context.Context, agent *fort.Agent, req *fort.Request, verbose, jsonOutput bool) {
-	fmt.Println("\n[Analysis] Analyzing code...")
+	if !jsonOutput {
+		fmt.Println("\n[Analysis] Analyzing code...")
+	}
 
 	result, err := agent.Analyze(ctx, req)
 	if err != nil {
@@ -402,8 +436,15 @@ func runAnalyze(ctx context.Context, agent *fort.Agent, req *fort.Request, verbo
 	}
 }
 
-func runExecute(ctx context.Context, agent *fort.Agent, req *fort.Request, verbose, jsonOutput bool) {
-	fmt.Println("\n[Execution] Running full pipeline...")
+func runExecute(
+	ctx context.Context,
+	agent *fort.Agent,
+	req *fort.Request,
+	verbose, jsonOutput, requireValidation bool,
+) {
+	if !jsonOutput {
+		fmt.Println("\n[Execution] Running full pipeline...")
+	}
 
 	if verbose {
 		fmt.Println("  → Phase 1: Analysis")
@@ -411,11 +452,13 @@ func runExecute(ctx context.Context, agent *fort.Agent, req *fort.Request, verbo
 		fmt.Printf("  → Requested limits: timeout=%ds memory=%dMB network=%t\n", req.MaxTimeoutSec, req.MaxMemoryMB, req.AllowNetwork)
 	}
 
-	execution, err := agent.Execute(ctx, req)
+	showProgress := !jsonOutput || verbose
+	execution, err := executeWithPhaseProgress(ctx, agent, req, requireValidation, showProgress, jsonOutput)
 
 	if jsonOutput {
+		executionForJSON := sanitizeExecutionForJSON(execution)
 		output := map[string]interface{}{
-			"execution": execution,
+			"execution": executionForJSON,
 			"error":     nil,
 		}
 		if err != nil {
@@ -486,11 +529,11 @@ func runExecute(ctx context.Context, agent *fort.Agent, req *fort.Request, verbo
 
 	if err != nil {
 		fmt.Printf("\n❌ Error: %v\n", err)
-		os.Exit(1)
+		exitWithCode(1)
 	}
 
 	if execution.Result != nil && !execution.Result.Success {
-		os.Exit(execution.Result.ExitCode)
+		exitWithCode(execution.Result.ExitCode)
 	}
 }
 
@@ -544,7 +587,8 @@ func runSandbox(
 			policy.MaxTimeoutSec, policy.MaxMemoryMB, policy.MaxCPU, policy.AllowNetwork, policy.AllowFileWrite)
 	}
 
-	execution, execErr := agent.Execute(ctx, req)
+	showProgress := !jsonOutput || verbose
+	execution, execErr := executeWithPhaseProgress(ctx, agent, req, config.RequireValidation, showProgress, jsonOutput)
 
 	var llm *fort.OpenAILLMClient
 	if config.LLMBaseURL != "" {
@@ -558,8 +602,9 @@ func runSandbox(
 	review, reviewErr := llm.ReviewSandboxExecution(ctx, execution, execErr)
 
 	if jsonOutput {
+		executionForJSON := sanitizeExecutionForJSON(execution)
 		output := map[string]interface{}{
-			"execution":        execution,
+			"execution":        executionForJSON,
 			"execution_error":  "",
 			"llm_review":       review,
 			"llm_review_error": "",
@@ -572,10 +617,10 @@ func runSandbox(
 		}
 		printJSON(output)
 		if execErr != nil {
-			os.Exit(1)
+			exitWithCode(1)
 		}
 		if execution != nil && execution.Result != nil && !execution.Result.Success {
-			os.Exit(execution.Result.ExitCode)
+			exitWithCode(execution.Result.ExitCode)
 		}
 		return
 	}
@@ -641,10 +686,10 @@ func runSandbox(
 
 	if execErr != nil {
 		fmt.Printf("\n❌ Sandbox pipeline failed: %v\n", execErr)
-		os.Exit(1)
+		exitWithCode(1)
 	}
 	if execution != nil && execution.Result != nil && !execution.Result.Success {
-		os.Exit(execution.Result.ExitCode)
+		exitWithCode(execution.Result.ExitCode)
 	}
 }
 
@@ -671,15 +716,439 @@ func truncate(s string, maxLen int) string {
 	return s
 }
 
+func executeWithPhaseProgress(
+	ctx context.Context,
+	agent *fort.Agent,
+	req *fort.Request,
+	requireValidation bool,
+	showProgress bool,
+	progressToStderr bool,
+) (*fort.Execution, error) {
+	if !showProgress {
+		return agent.Execute(ctx, req)
+	}
+
+	writer := io.Writer(os.Stdout)
+	interactive := interactiveStdout
+	useColor := colorStdout
+	if progressToStderr {
+		writer = os.Stderr
+		interactive = interactiveStderr
+		useColor = colorStderr
+	}
+
+	renderer := newPhaseProgressRenderer("Pipeline", expectedPhaseCount(requireValidation), writer, interactive, useColor)
+	done := make(chan struct {
+		execution *fort.Execution
+		err       error
+	}, 1)
+
+	go func() {
+		execution, err := agent.Execute(ctx, req)
+		done <- struct {
+			execution *fort.Execution
+			err       error
+		}{execution: execution, err: err}
+	}()
+
+	ticker := time.NewTicker(120 * time.Millisecond)
+	defer ticker.Stop()
+
+	renderer.Render(0, fort.PhaseAnalysis, false, nil)
+	for {
+		select {
+		case outcome := <-done:
+			finalCompleted := 0
+			finalPhase := fort.PhaseComplete
+			if outcome.execution != nil {
+				finalCompleted = len(outcome.execution.Phases)
+				finalPhase = outcome.execution.Request.CurrentPhase
+			}
+			renderer.Render(finalCompleted, finalPhase, true, outcome.err)
+			return outcome.execution, outcome.err
+		case <-ticker.C:
+			exec, ok := agent.GetExecution(req.ID)
+			if !ok || exec == nil {
+				renderer.Render(0, fort.PhaseAnalysis, false, nil)
+				continue
+			}
+			renderer.Render(len(exec.Phases), exec.Request.CurrentPhase, false, nil)
+		}
+	}
+}
+
+func expectedPhaseCount(requireValidation bool) int {
+	if requireValidation {
+		return 5
+	}
+	return 4
+}
+
+type phaseProgressRenderer struct {
+	prefix        string
+	total         int
+	startedAt     time.Time
+	writer        io.Writer
+	interactive   bool
+	useColor      bool
+	spinnerIdx    int
+	lastCompleted int
+	lastPhase     fort.Phase
+	initialized   bool
+}
+
+func newPhaseProgressRenderer(prefix string, total int, writer io.Writer, interactive, useColor bool) *phaseProgressRenderer {
+	if total <= 0 {
+		total = 1
+	}
+	return &phaseProgressRenderer{
+		prefix:        prefix,
+		total:         total,
+		startedAt:     time.Now(),
+		writer:        writer,
+		interactive:   interactive,
+		useColor:      useColor,
+		lastCompleted: -1,
+	}
+}
+
+func (r *phaseProgressRenderer) Render(completed int, phase fort.Phase, done bool, runErr error) {
+	completed = clampInt(completed, 0, r.total)
+	percent := (completed * 100) / r.total
+	elapsed := formatProgressDuration(time.Since(r.startedAt))
+	phaseName := phaseLabel(phase)
+	bar := phaseProgressBar(completed, r.total, r.useColor)
+	icon := r.icon(done, runErr != nil)
+	line := fmt.Sprintf("%s %s %3d%% %d/%d  %s  %s", icon, bar, percent, completed, r.total, phaseName, elapsed)
+
+	if done {
+		if runErr != nil {
+			line += "  " + colorizeWith(r.useColor, "FAILED", ansiRed)
+		} else {
+			line += "  " + colorizeWith(r.useColor, "DONE", ansiGreen)
+		}
+	}
+
+	if !r.interactive {
+		if !done && r.initialized && completed == r.lastCompleted && phase == r.lastPhase {
+			return
+		}
+		fmt.Fprintf(r.writer, "[%s] %s\n", r.prefix, stripANSI(line))
+		r.lastCompleted = completed
+		r.lastPhase = phase
+		r.initialized = true
+		return
+	}
+
+	fmt.Fprintf(r.writer, "\r\033[2K%s", colorizeWith(r.useColor, "["+r.prefix+"]", ansiBlue)+" "+line)
+	if done {
+		fmt.Fprintln(r.writer)
+	}
+
+	r.lastCompleted = completed
+	r.lastPhase = phase
+	r.initialized = true
+}
+
+func (r *phaseProgressRenderer) icon(done, failed bool) string {
+	if done {
+		if failed {
+			return colorizeWith(r.useColor, "✖", ansiRed)
+		}
+		return colorizeWith(r.useColor, "✔", ansiGreen)
+	}
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	icon := frames[r.spinnerIdx%len(frames)]
+	r.spinnerIdx++
+	return colorizeWith(r.useColor, icon, ansiCyan)
+}
+
+func phaseProgressBar(completed, total int, useColor bool) string {
+	if total <= 0 {
+		total = 1
+	}
+	completed = clampInt(completed, 0, total)
+	const width = 28
+	filled := (completed * width) / total
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > width {
+		filled = width
+	}
+
+	filledPart := strings.Repeat("█", filled)
+	emptyPart := strings.Repeat("░", width-filled)
+	if useColor {
+		filledPart = colorizeWith(true, filledPart, ansiGreen)
+		emptyPart = colorizeWith(true, emptyPart, ansiGray)
+	}
+	return "│" + filledPart + emptyPart + "│"
+}
+
+func phaseLabel(phase fort.Phase) string {
+	switch phase {
+	case fort.PhaseAnalysis:
+		return "Analyze"
+	case fort.PhaseSynthesis:
+		return "Synthesize"
+	case fort.PhaseValidation:
+		return "Validate"
+	case fort.PhaseBuild:
+		return "Build"
+	case fort.PhaseExecution:
+		return "Execute"
+	case fort.PhaseComplete:
+		return "Complete"
+	default:
+		if strings.TrimSpace(string(phase)) == "" {
+			return "Pending"
+		}
+		return titleCaseToken(string(phase))
+	}
+}
+
+func renderReportProgress(phase, total int, name string) {
+	if total <= 0 {
+		total = 1
+	}
+	phase = clampInt(phase, 0, total)
+	percent := (phase * 100) / total
+	label := strings.TrimSpace(name)
+	if label == "" {
+		label = fmt.Sprintf("Phase %d", phase)
+	}
+	icon := colorizeWith(colorStderr, "◉", ansiCyan)
+	if phase >= total {
+		icon = colorizeWith(colorStderr, "✔", ansiGreen)
+	}
+
+	line := fmt.Sprintf("%s %s %3d%% %d/%d  %s", icon, phaseProgressBar(phase, total, colorStderr), percent, phase, total, label)
+	if !interactiveStderr {
+		fmt.Fprintf(os.Stderr, "[Report] %s\n", stripANSI(line))
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "\r\033[2K%s %s", colorizeWith(colorStderr, "[Report]", ansiBlue), line)
+	if phase >= total {
+		fmt.Fprintln(os.Stderr)
+	}
+}
+
+const (
+	ansiReset = "\033[0m"
+	ansiGray  = "\033[90m"
+	ansiRed   = "\033[31m"
+	ansiGreen = "\033[32m"
+	ansiBlue  = "\033[34m"
+	ansiCyan  = "\033[36m"
+)
+
+func colorizeWith(enabled bool, text, code string) string {
+	if !enabled || strings.TrimSpace(code) == "" {
+		return text
+	}
+	return code + text + ansiReset
+}
+
+func stripANSI(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inEscape := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inEscape {
+			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') {
+				inEscape = false
+			}
+			continue
+		}
+		if ch == 0x1b {
+			inEscape = true
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return b.String()
+}
+
+func clampInt(v, min, max int) int {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func formatProgressDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	totalSec := int(d.Seconds())
+	minutes := totalSec / 60
+	seconds := totalSec % 60
+	return fmt.Sprintf("%02d:%02d", minutes, seconds)
+}
+
+func detectInteractiveTerminal(file *os.File) bool {
+	if file == nil {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	if (info.Mode() & os.ModeCharDevice) == 0 {
+		return false
+	}
+	term := strings.ToLower(strings.TrimSpace(os.Getenv("TERM")))
+	return term != "" && term != "dumb"
+}
+
+func titleCaseToken(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	runes := []rune(s)
+	out := make([]rune, 0, len(runes))
+	capNext := true
+	for _, r := range runes {
+		if r == '_' || r == '-' || r == ' ' {
+			out = append(out, ' ')
+			capNext = true
+			continue
+		}
+		if capNext {
+			if r >= 'a' && r <= 'z' {
+				r = r - ('a' - 'A')
+			}
+			capNext = false
+		}
+		out = append(out, r)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func printJSON(v interface{}) {
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	enc.Encode(v)
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		fatal("Failed to serialize JSON output: %v", err)
+	}
+	data = append(data, '\n')
+	writeJSONOutput(data)
+}
+
+func writeJSONOutput(data []byte) {
+	if jsonOutputPath == "" {
+		fmt.Print(string(data))
+		return
+	}
+
+	dir := filepath.Dir(jsonOutputPath)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			fatal("Failed to create output directory %s: %v", dir, err)
+		}
+	}
+
+	if err := os.WriteFile(jsonOutputPath, data, 0644); err != nil {
+		fatal("Failed to write JSON output to %s: %v", jsonOutputPath, err)
+	}
+}
+
+func sanitizeExecutionForJSON(execution *fort.Execution) *fort.Execution {
+	if execution == nil {
+		return nil
+	}
+
+	executionCopy := *execution
+	requestCopy := executionCopy.Request
+
+	if requestCopy.SourceContent != "" {
+		requestCopy.SourceContent = fmt.Sprintf("[omitted %d bytes of source content]", len(requestCopy.SourceContent))
+	}
+	executionCopy.Request = requestCopy
+	return &executionCopy
 }
 
 func fatal(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
-	os.Exit(1)
+	exitWithCode(1)
+}
+
+func exitWithCode(code int) {
+	if outputCleanup != nil {
+		outputCleanup()
+	}
+	os.Exit(code)
+}
+
+func setupOutputTee(path string) (func(), error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return func() {}, nil
+	}
+
+	dir := filepath.Dir(path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, err
+		}
+	}
+
+	logFile, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	origStdout := os.Stdout
+	origStderr := os.Stderr
+
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		_ = logFile.Close()
+		return nil, err
+	}
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
+		_ = logFile.Close()
+		return nil, err
+	}
+
+	os.Stdout = stdoutWriter
+	os.Stderr = stderrWriter
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(io.MultiWriter(origStdout, logFile), stdoutReader)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(io.MultiWriter(origStderr, logFile), stderrReader)
+	}()
+
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			_ = stdoutWriter.Close()
+			_ = stderrWriter.Close()
+			wg.Wait()
+			os.Stdout = origStdout
+			os.Stderr = origStderr
+			_ = stdoutReader.Close()
+			_ = stderrReader.Close()
+			_ = logFile.Close()
+		})
+	}
+
+	return cleanup, nil
 }
 
 func generateID() string {
@@ -710,7 +1179,7 @@ func initConfig(path string) {
 	if _, err := os.Stat(path); err == nil {
 		fmt.Printf("Config file already exists: %s\n", path)
 		fmt.Println("Remove it first or specify a different path with -config")
-		os.Exit(1)
+		exitWithCode(1)
 	}
 
 	content := fort.GenerateExampleConfig()
@@ -755,7 +1224,7 @@ func runReport(ctx context.Context, config fort.AgentConfig, code, lang, purpose
 	var progress fort.ReportProgressFn
 	if verbose {
 		progress = func(phase int, name string) {
-			fmt.Printf("  -> Phase %d: %s...\n", phase, name)
+			renderReportProgress(phase, 5, name)
 		}
 	}
 
@@ -773,8 +1242,11 @@ func runReport(ctx context.Context, config fort.AgentConfig, code, lang, purpose
 	if err != nil {
 		fatal("Failed to serialize report: %v", err)
 	}
+	if len(jsonData) == 0 || jsonData[len(jsonData)-1] != '\n' {
+		jsonData = append(jsonData, '\n')
+	}
 
-	fmt.Println(string(jsonData))
+	writeJSONOutput(jsonData)
 
 	// Print summary to stderr if verbose
 	if verbose {

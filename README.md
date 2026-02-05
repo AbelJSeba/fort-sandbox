@@ -78,6 +78,12 @@ export GROQ_API_KEY=gsk_...            # Groq
 # Sandbox flow with raw LLM request/response dumps
 ./fort -mode sandbox -file script.py -verbose -llm-dump-dir .fort-llm-dumps
 
+# Write JSON result directly to file
+./fort -json -mode sandbox -file script.py -json-out reports/sandbox.json
+
+# Save full CLI output (stdout+stderr) to a log file
+./fort -mode sandbox -file script.py -verbose -log-file logs/fort-run.log
+
 # Epic showcase workload (strict sandbox defaults)
 ./fort -mode sandbox -file examples/epic_sandbox_showcase.py -purpose "Epic sandbox demo" -verbose
 
@@ -185,6 +191,10 @@ Execution:
 Output:
   -json
         Output results as JSON
+  -json-out string
+        Write JSON output to file
+  -log-file string
+        Write combined stdout/stderr logs to file
   -verbose
         Verbose output
   -banner
@@ -265,6 +275,20 @@ What to expect:
 ```bash
 ./fort -json -file script.py | jq '.result.stdout'
 ```
+
+Write JSON directly to a file:
+```bash
+./fort -json -mode sandbox -file script.py -json-out reports/sandbox.json
+./fort -mode report -file script.py -json-out reports/report.json
+```
+
+Capture logs to a file:
+```bash
+./fort -mode sandbox -file script.py -verbose -log-file logs/fort-run.log
+```
+
+When running `execute`, `sandbox`, or verbose `report`, Fort shows a live phase progress bar.
+In `-json -verbose` mode, progress and debug logs go to `stderr`, while JSON stays clean on `stdout` (or `-json-out`).
 
 ## Library Usage
 
