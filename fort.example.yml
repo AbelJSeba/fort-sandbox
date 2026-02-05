@@ -26,6 +26,9 @@ llm:
   # Temperature for LLM responses (0.0-1.0, lower = more deterministic)
   temperature: 0.1
 
+  # Optional: dump raw LLM request/response payloads to JSON files
+  # dump_dir: .fort-llm-dumps
+
 # Execution Defaults
 execution:
   timeout_sec: 60      # Maximum execution time

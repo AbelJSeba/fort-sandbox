@@ -49,6 +49,7 @@ func main() {
 		llmProvider   = flag.String("provider", "", "LLM provider: openai, openrouter, deepseek, together, groq, ollama")
 		llmModel      = flag.String("model", "", "LLM model to use")
 		llmBaseURL    = flag.String("base-url", "", "Custom LLM API base URL")
+		llmDumpDir    = flag.String("llm-dump-dir", "", "Directory to dump LLM requests/responses as JSON")
 		listProviders = flag.Bool("list-providers", false, "List available LLM providers")
 	)
 	flag.Parse()
@@ -98,6 +99,11 @@ func main() {
 	if *llmBaseURL != "" {
 		cfg.LLM.BaseURL = *llmBaseURL
 	}
+	if *llmDumpDir != "" {
+		cfg.LLM.DumpDir = *llmDumpDir
+	} else if cfg.LLM.DumpDir == "" {
+		cfg.LLM.DumpDir = os.Getenv("FORT_LLM_DUMP_DIR")
+	}
 	if *timeout > 0 {
 		cfg.Execution.TimeoutSec = *timeout
 	}
@@ -136,11 +142,15 @@ func main() {
 
 	// Convert config to agent config
 	agentConfig := cfg.ToAgentConfig()
+	agentConfig.Verbose = *verbose
 
 	if *verbose {
 		fmt.Printf("Provider: %s\n", cfg.LLM.Provider)
 		fmt.Printf("Model: %s\n", cfg.ResolveModel())
 		fmt.Printf("Base URL: %s\n", cfg.ResolveBaseURL())
+		if cfg.LLM.DumpDir != "" {
+			fmt.Printf("LLM dump dir: %s\n", cfg.LLM.DumpDir)
+		}
 		fmt.Println()
 	}
 
@@ -397,6 +407,8 @@ func runExecute(ctx context.Context, agent *fort.Agent, req *fort.Request, verbo
 
 	if verbose {
 		fmt.Println("  → Phase 1: Analysis")
+		fmt.Printf("  → Request ID: %s\n", req.ID)
+		fmt.Printf("  → Requested limits: timeout=%ds memory=%dMB network=%t\n", req.MaxTimeoutSec, req.MaxMemoryMB, req.AllowNetwork)
 	}
 
 	execution, err := agent.Execute(ctx, req)
@@ -527,6 +539,9 @@ func runSandbox(
 
 	if verbose && !jsonOutput {
 		fmt.Println("  -> Running secure execution pipeline...")
+		fmt.Printf("  -> Request ID: %s\n", req.ID)
+		fmt.Printf("  -> Policy: timeout=%ds memory=%dMB cpu=%.2f network=%t file_write=%t\n",
+			policy.MaxTimeoutSec, policy.MaxMemoryMB, policy.MaxCPU, policy.AllowNetwork, policy.AllowFileWrite)
 	}
 
 	execution, execErr := agent.Execute(ctx, req)
@@ -537,6 +552,7 @@ func runSandbox(
 	} else {
 		llm = fort.NewOpenAILLMClient(config.LLMAPIKey, config.LLMModel)
 	}
+	llm.SetDebugOptions(config.Verbose, config.LLMDumpDir)
 
 	var review *fort.SandboxExecutionReview
 	review, reviewErr := llm.ReviewSandboxExecution(ctx, execution, execErr)
@@ -724,6 +740,7 @@ func runReport(ctx context.Context, config fort.AgentConfig, code, lang, purpose
 	} else {
 		llm = fort.NewOpenAILLMClient(config.LLMAPIKey, config.LLMModel)
 	}
+	llm.SetDebugOptions(config.Verbose, config.LLMDumpDir)
 
 	// Create report generator
 	reportConfig := fort.DefaultReportConfig()

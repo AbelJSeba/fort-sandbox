@@ -75,6 +75,9 @@ export GROQ_API_KEY=gsk_...            # Groq
 # Full sandbox flow + LLM artifact review
 ./fort -mode sandbox -file script.py -verbose
 
+# Sandbox flow with raw LLM request/response dumps
+./fort -mode sandbox -file script.py -verbose -llm-dump-dir .fort-llm-dumps
+
 # Epic showcase workload (strict sandbox defaults)
 ./fort -mode sandbox -file examples/epic_sandbox_showcase.py -purpose "Epic sandbox demo" -verbose
 
@@ -162,6 +165,8 @@ LLM Provider:
         LLM model to use (provider-specific)
   -base-url string
         Custom LLM API base URL
+  -llm-dump-dir string
+        Directory to dump LLM requests/responses as JSON
   -config string
         Path to config file (default: auto-detect)
   -list-providers
@@ -404,6 +409,7 @@ llm:
   # api_key: sk-...             # Optional: can use environment variables
   # base_url: https://...       # Optional: custom endpoint
   temperature: 0.1
+  # dump_dir: .fort-llm-dumps   # Optional: write raw LLM request/response JSON
 
 # Execution Defaults
 execution:
@@ -466,6 +472,7 @@ GROQ_API_KEY=gsk_...
 # Generic fallbacks
 FORT_API_KEY=...               # Used if provider-specific key not found
 LLM_API_KEY=...                # Alternative generic key
+FORT_LLM_DUMP_DIR=.fort-llm-dumps
 ```
 
 ### Security Policy (Library)

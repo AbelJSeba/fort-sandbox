@@ -31,6 +31,8 @@ type AgentConfig struct {
 	LLMModel    string
 	LLMAPIKey   string
 	LLMBaseURL  string
+	LLMDumpDir  string
+	Verbose     bool
 
 	// Builder configuration
 	BuildTimeout time.Duration
@@ -60,12 +62,14 @@ func DefaultAgentConfig() AgentConfig {
 // NewAgent creates a new Fort Agent
 func NewAgent(config AgentConfig) (*Agent, error) {
 	// Create LLM client
-	var llm LLMClient
+	var llmClient *OpenAILLMClient
 	if config.LLMBaseURL != "" {
-		llm = NewOpenAILLMClientWithBaseURL(config.LLMAPIKey, config.LLMModel, config.LLMBaseURL)
+		llmClient = NewOpenAILLMClientWithBaseURL(config.LLMAPIKey, config.LLMModel, config.LLMBaseURL)
 	} else {
-		llm = NewOpenAILLMClient(config.LLMAPIKey, config.LLMModel)
+		llmClient = NewOpenAILLMClient(config.LLMAPIKey, config.LLMModel)
 	}
+	llmClient.SetDebugOptions(config.Verbose, config.LLMDumpDir)
+	var llm LLMClient = llmClient
 
 	// Create Docker client
 	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())

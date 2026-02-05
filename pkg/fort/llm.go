@@ -8,7 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/sashabaranov/go-openai"
 )
@@ -40,6 +45,10 @@ type OpenAILLMClient struct {
 	apiKey  string
 	model   string
 	baseURL string
+	verbose bool
+	dumpDir string
+	dumpSeq uint64
+	dumpMu  sync.Mutex
 }
 
 // NewOpenAILLMClient creates an OpenAI-based LLM client
@@ -63,6 +72,84 @@ func NewOpenAILLMClientWithBaseURL(apiKey, model, baseURL string) *OpenAILLMClie
 		model:   model,
 		baseURL: baseURL,
 	}
+}
+
+// SetDebugOptions enables verbose logs and optional JSON dumps of LLM requests/responses.
+func (c *OpenAILLMClient) SetDebugOptions(verbose bool, dumpDir string) {
+	c.verbose = verbose
+	c.dumpDir = strings.TrimSpace(dumpDir)
+}
+
+func (c *OpenAILLMClient) logf(format string, args ...interface{}) {
+	if !c.verbose {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[LLM] "+format+"\n", args...)
+}
+
+func (c *OpenAILLMClient) dumpLLMJSON(kind string, payload map[string]interface{}) {
+	dumpDir := strings.TrimSpace(c.dumpDir)
+	if dumpDir == "" {
+		return
+	}
+
+	c.dumpMu.Lock()
+	defer c.dumpMu.Unlock()
+
+	if err := os.MkdirAll(dumpDir, 0755); err != nil {
+		c.logf("Failed to create LLM dump dir %q: %v", dumpDir, err)
+		return
+	}
+
+	seq := atomic.AddUint64(&c.dumpSeq, 1)
+	filename := fmt.Sprintf(
+		"%s_%06d_%s.json",
+		time.Now().UTC().Format("20060102T150405.000Z"),
+		seq,
+		sanitizeDumpToken(kind),
+	)
+	path := filepath.Join(dumpDir, filename)
+
+	record := map[string]interface{}{
+		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+		"model":     c.model,
+		"base_url":  c.baseURL,
+		"kind":      kind,
+		"payload":   payload,
+	}
+
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		c.logf("Failed to serialize LLM dump %q: %v", kind, err)
+		return
+	}
+
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		c.logf("Failed to write LLM dump file %q: %v", path, err)
+		return
+	}
+	c.logf("Wrote LLM dump: %s", path)
+}
+
+func sanitizeDumpToken(v string) string {
+	v = strings.TrimSpace(strings.ToLower(v))
+	if v == "" {
+		return "llm"
+	}
+	var b strings.Builder
+	b.Grow(len(v))
+	for _, r := range v {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('_')
+	}
+	out := strings.Trim(b.String(), "_")
+	if out == "" {
+		return "llm"
+	}
+	return out
 }
 
 // Analyze performs code analysis using LLM
@@ -265,12 +352,14 @@ Return ONLY valid JSON, no markdown.`
 
 func (c *OpenAILLMClient) generateText(ctx context.Context, systemPrompt, userPrompt string, forceJSONObject bool) (string, error) {
 	if isCodexModel(c.model) {
+		c.logf("Routing model %q to /responses endpoint", c.model)
 		content, err := c.createResponses(ctx, systemPrompt, userPrompt)
 		if err == nil {
 			return content, nil
 		}
 
 		// Fallback for providers that expose Codex-like models but don't support /responses.
+		c.logf("/responses failed for model %q: %v; trying /completions fallback", c.model, err)
 		fallbackContent, fallbackErr := c.createCompletion(ctx, systemPrompt, userPrompt)
 		if fallbackErr == nil {
 			return fallbackContent, nil
@@ -279,11 +368,13 @@ func (c *OpenAILLMClient) generateText(ctx context.Context, systemPrompt, userPr
 	}
 
 	if prefersCompletionsEndpoint(c.model) {
+		c.logf("Routing model %q to /completions endpoint", c.model)
 		content, err := c.createCompletion(ctx, systemPrompt, userPrompt)
 		if err == nil {
 			return content, nil
 		}
 		if shouldFallbackToChatEndpoint(err) && !isStrictCompletionsModel(c.model) {
+			c.logf("/completions failed for model %q: %v; trying /chat/completions fallback", c.model, err)
 			fallbackContent, fallbackErr := c.createChatCompletion(ctx, systemPrompt, userPrompt, forceJSONObject)
 			if fallbackErr == nil {
 				return fallbackContent, nil
@@ -293,11 +384,13 @@ func (c *OpenAILLMClient) generateText(ctx context.Context, systemPrompt, userPr
 		return "", err
 	}
 
+	c.logf("Routing model %q to /chat/completions endpoint", c.model)
 	content, err := c.createChatCompletion(ctx, systemPrompt, userPrompt, forceJSONObject)
 	if err == nil {
 		return content, nil
 	}
 	if shouldFallbackToCompletionsEndpoint(err) {
+		c.logf("/chat/completions failed for model %q: %v; trying /completions fallback", c.model, err)
 		fallbackContent, fallbackErr := c.createCompletion(ctx, systemPrompt, userPrompt)
 		if fallbackErr == nil {
 			return fallbackContent, nil
@@ -323,9 +416,16 @@ func (c *OpenAILLMClient) createResponses(ctx context.Context, systemPrompt, use
 		baseURL = "https://api.openai.com/v1"
 	}
 	url := baseURL + "/responses"
+	c.logf("POST %s", url)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
+		c.dumpLLMJSON("responses_error", map[string]interface{}{
+			"endpoint": "responses",
+			"url":      url,
+			"request":  reqBody,
+			"error":    fmt.Sprintf("failed to create request: %v", err),
+		})
 		return "", fmt.Errorf("failed to create responses request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -335,27 +435,65 @@ func (c *OpenAILLMClient) createResponses(ctx context.Context, systemPrompt, use
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		c.dumpLLMJSON("responses_error", map[string]interface{}{
+			"endpoint": "responses",
+			"url":      url,
+			"request":  reqBody,
+			"error":    err.Error(),
+		})
 		return "", fmt.Errorf("responses request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		c.dumpLLMJSON("responses_error", map[string]interface{}{
+			"endpoint":    "responses",
+			"url":         url,
+			"request":     reqBody,
+			"status_code": resp.StatusCode,
+			"error":       fmt.Sprintf("failed to read response body: %v", err),
+		})
 		return "", fmt.Errorf("failed to read responses body: %w", err)
 	}
+	c.logf("/responses status=%d", resp.StatusCode)
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
 		msg := parseResponsesErrorMessage(body)
+		c.dumpLLMJSON("responses_error", map[string]interface{}{
+			"endpoint":      "responses",
+			"url":           url,
+			"request":       reqBody,
+			"status_code":   resp.StatusCode,
+			"status":        resp.Status,
+			"error":         msg,
+			"response_body": string(body),
+		})
 		return "", fmt.Errorf("error, status code: %d, status: %s, message: %s", resp.StatusCode, resp.Status, msg)
 	}
 
 	var response responsesAPIResponse
 	if err := json.Unmarshal(body, &response); err != nil {
+		c.dumpLLMJSON("responses_error", map[string]interface{}{
+			"endpoint":      "responses",
+			"url":           url,
+			"request":       reqBody,
+			"status_code":   resp.StatusCode,
+			"error":         fmt.Sprintf("failed to decode response payload: %v", err),
+			"response_body": string(body),
+		})
 		return "", fmt.Errorf("failed to decode responses payload: %w", err)
 	}
 
 	content := strings.TrimSpace(response.OutputText)
 	if content != "" {
+		c.dumpLLMJSON("responses_success", map[string]interface{}{
+			"endpoint":        "responses",
+			"url":             url,
+			"request":         reqBody,
+			"status_code":     resp.StatusCode,
+			"response_output": response,
+		})
 		return content, nil
 	}
 
@@ -369,9 +507,24 @@ func (c *OpenAILLMClient) createResponses(ctx context.Context, systemPrompt, use
 		}
 	}
 	if len(chunks) > 0 {
+		c.dumpLLMJSON("responses_success", map[string]interface{}{
+			"endpoint":        "responses",
+			"url":             url,
+			"request":         reqBody,
+			"status_code":     resp.StatusCode,
+			"response_output": response,
+		})
 		return strings.Join(chunks, "\n"), nil
 	}
 
+	c.dumpLLMJSON("responses_error", map[string]interface{}{
+		"endpoint":        "responses",
+		"url":             url,
+		"request":         reqBody,
+		"status_code":     resp.StatusCode,
+		"response_output": response,
+		"error":           "no response from LLM",
+	})
 	return "", fmt.Errorf("no response from LLM")
 }
 
@@ -429,20 +582,45 @@ func (c *OpenAILLMClient) createChatCompletion(
 			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
 		}
 	}
+	c.logf("POST /chat/completions model=%q response_format=%t", c.model, forceJSONObject)
 
 	resp, err := c.client.CreateChatCompletion(ctx, req)
 	if err != nil {
+		c.dumpLLMJSON("chat_completions_error", map[string]interface{}{
+			"endpoint": "chat_completions",
+			"request":  req,
+			"error":    err.Error(),
+		})
 		if forceJSONObject && isUnsupportedResponseFormatError(err) {
+			c.logf("Model %q rejected response_format=json_object, retrying without response_format", c.model)
 			req.ResponseFormat = nil
 			resp, err = c.client.CreateChatCompletion(ctx, req)
+			if err != nil {
+				c.dumpLLMJSON("chat_completions_error", map[string]interface{}{
+					"endpoint": "chat_completions",
+					"request":  req,
+					"error":    err.Error(),
+				})
+			}
 		}
 	}
 	if err != nil {
 		return "", err
 	}
 	if len(resp.Choices) == 0 {
+		c.dumpLLMJSON("chat_completions_error", map[string]interface{}{
+			"endpoint": "chat_completions",
+			"request":  req,
+			"response": resp,
+			"error":    "no response from LLM",
+		})
 		return "", fmt.Errorf("no response from LLM")
 	}
+	c.dumpLLMJSON("chat_completions_success", map[string]interface{}{
+		"endpoint": "chat_completions",
+		"request":  req,
+		"response": resp,
+	})
 	return resp.Choices[0].Message.Content, nil
 }
 
@@ -458,17 +636,35 @@ func isUnsupportedResponseFormatError(err error) bool {
 }
 
 func (c *OpenAILLMClient) createCompletion(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
-	resp, err := c.client.CreateCompletion(ctx, openai.CompletionRequest{
+	req := openai.CompletionRequest{
 		Model:     c.model,
 		Prompt:    formatCompletionPrompt(systemPrompt, userPrompt),
 		MaxTokens: 4000,
-	})
+	}
+	c.logf("POST /completions model=%q", c.model)
+	resp, err := c.client.CreateCompletion(ctx, req)
 	if err != nil {
+		c.dumpLLMJSON("completions_error", map[string]interface{}{
+			"endpoint": "completions",
+			"request":  req,
+			"error":    err.Error(),
+		})
 		return "", err
 	}
 	if len(resp.Choices) == 0 {
+		c.dumpLLMJSON("completions_error", map[string]interface{}{
+			"endpoint": "completions",
+			"request":  req,
+			"response": resp,
+			"error":    "no response from LLM",
+		})
 		return "", fmt.Errorf("no response from LLM")
 	}
+	c.dumpLLMJSON("completions_success", map[string]interface{}{
+		"endpoint": "completions",
+		"request":  req,
+		"response": resp,
+	})
 	return resp.Choices[0].Text, nil
 }
 

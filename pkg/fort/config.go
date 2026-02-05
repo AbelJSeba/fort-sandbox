@@ -39,6 +39,9 @@ type LLMConfig struct {
 
 	// Temperature for LLM responses (0.0-1.0)
 	Temperature float32 `yaml:"temperature"`
+
+	// Optional directory to dump LLM requests/responses as JSON
+	DumpDir string `yaml:"dump_dir"`
 }
 
 // ExecutionConfig holds default execution settings
@@ -66,10 +69,10 @@ type DockerConfig struct {
 
 // ProviderInfo contains provider-specific defaults
 type ProviderInfo struct {
-	Name       string
-	BaseURL    string
-	EnvKey     string
-	Models     []string
+	Name         string
+	BaseURL      string
+	EnvKey       string
+	Models       []string
 	DefaultModel string
 }
 
@@ -261,6 +264,7 @@ func (c *Config) ToAgentConfig() AgentConfig {
 	config.LLMModel = c.ResolveModel()
 	config.LLMAPIKey = c.ResolveAPIKey()
 	config.LLMBaseURL = c.ResolveBaseURL()
+	config.LLMDumpDir = c.LLM.DumpDir
 
 	config.RequireValidation = c.Security.RequireValidate
 
@@ -318,6 +322,9 @@ llm:
 
   # Temperature for LLM responses (0.0-1.0, lower = more deterministic)
   temperature: 0.1
+
+  # Optional: dump raw LLM request/response payloads to JSON files
+  # dump_dir: .fort-llm-dumps
 
 # Execution Defaults
 execution:
