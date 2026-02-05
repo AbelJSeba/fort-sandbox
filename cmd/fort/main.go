@@ -32,23 +32,23 @@ const banner = `
 
 func main() {
 	var (
-		mode         = flag.String("mode", "execute", "Mode: execute, analyze, validate, quick-validate, report, init-config")
-		file         = flag.String("file", "", "Path to code file (or - for stdin)")
-		code         = flag.String("code", "", "Inline code to execute")
-		lang         = flag.String("lang", "", "Language hint (python, go, js, etc.)")
-		purpose      = flag.String("purpose", "", "Description of what the code should do")
-		timeout      = flag.Int("timeout", 0, "Execution timeout in seconds (0 = use config)")
-		memoryMB     = flag.Int("memory", 0, "Memory limit in MB (0 = use config)")
-		allowNet     = flag.Bool("allow-network", false, "Allow network access")
-		jsonOutput   = flag.Bool("json", false, "Output results as JSON")
-		noValidate   = flag.Bool("no-validate", false, "Skip security validation (DANGEROUS)")
-		verbose      = flag.Bool("verbose", false, "Verbose output")
-		showBanner   = flag.Bool("banner", true, "Show banner")
-		showVersion  = flag.Bool("version", false, "Show version")
-		configFile   = flag.String("config", "", "Path to config file (default: auto-detect)")
-		llmProvider  = flag.String("provider", "", "LLM provider: openai, openrouter, deepseek, together, groq, ollama")
-		llmModel     = flag.String("model", "", "LLM model to use")
-		llmBaseURL   = flag.String("base-url", "", "Custom LLM API base URL")
+		mode          = flag.String("mode", "execute", "Mode: execute, analyze, validate, quick-validate, report, init-config")
+		file          = flag.String("file", "", "Path to code file (or - for stdin)")
+		code          = flag.String("code", "", "Inline code to execute")
+		lang          = flag.String("lang", "", "Language hint (python, go, js, etc.)")
+		purpose       = flag.String("purpose", "", "Description of what the code should do")
+		timeout       = flag.Int("timeout", 0, "Execution timeout in seconds (0 = use config)")
+		memoryMB      = flag.Int("memory", 0, "Memory limit in MB (0 = use config)")
+		allowNet      = flag.Bool("allow-network", false, "Allow network access")
+		jsonOutput    = flag.Bool("json", false, "Output results as JSON")
+		noValidate    = flag.Bool("no-validate", false, "Skip security validation (DANGEROUS)")
+		verbose       = flag.Bool("verbose", false, "Verbose output")
+		showBanner    = flag.Bool("banner", true, "Show banner")
+		showVersion   = flag.Bool("version", false, "Show version")
+		configFile    = flag.String("config", "", "Path to config file (default: auto-detect)")
+		llmProvider   = flag.String("provider", "", "LLM provider: openai, openrouter, deepseek, together, groq, ollama")
+		llmModel      = flag.String("model", "", "LLM model to use")
+		llmBaseURL    = flag.String("base-url", "", "Custom LLM API base URL")
 		listProviders = flag.Bool("list-providers", false, "List available LLM providers")
 	)
 	flag.Parse()
@@ -559,20 +559,19 @@ func runReport(ctx context.Context, config fort.AgentConfig, code, lang, purpose
 		Purpose:  purpose,
 	}
 
+	var progress fort.ReportProgressFn
 	if verbose {
-		fmt.Println("  -> Phase 1: Code structure analysis...")
+		progress = func(phase int, name string) {
+			fmt.Printf("  -> Phase %d: %s...\n", phase, name)
+		}
 	}
 
-	report, err := generator.GenerateReport(ctx, code, opts)
+	report, err := generator.GenerateReportWithProgress(ctx, code, opts, progress)
 	if err != nil {
 		fatal("Report generation failed: %v", err)
 	}
 
 	if verbose {
-		fmt.Println("  -> Phase 2: Security assessment...")
-		fmt.Println("  -> Phase 3: Capability detection...")
-		fmt.Println("  -> Phase 4: Dependency analysis...")
-		fmt.Println("  -> Phase 5: Generating recommendations...")
 		fmt.Println()
 	}
 

@@ -1,9 +1,13 @@
 package fort
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 
 	"github.com/sashabaranov/go-openai"
@@ -20,15 +24,19 @@ type LLMClient interface {
 // OpenAILLMClient implements LLMClient using OpenAI API
 type OpenAILLMClient struct {
 	client  *openai.Client
+	apiKey  string
 	model   string
 	baseURL string
 }
 
 // NewOpenAILLMClient creates an OpenAI-based LLM client
 func NewOpenAILLMClient(apiKey, model string) *OpenAILLMClient {
+	cfg := openai.DefaultConfig(apiKey)
 	return &OpenAILLMClient{
-		client: openai.NewClient(apiKey),
-		model:  model,
+		client:  openai.NewClient(apiKey),
+		apiKey:  apiKey,
+		model:   model,
+		baseURL: cfg.BaseURL,
 	}
 }
 
@@ -38,6 +46,7 @@ func NewOpenAILLMClientWithBaseURL(apiKey, model, baseURL string) *OpenAILLMClie
 	config.BaseURL = baseURL
 	return &OpenAILLMClient{
 		client:  openai.NewClientWithConfig(config),
+		apiKey:  apiKey,
 		model:   model,
 		baseURL: baseURL,
 	}
@@ -68,24 +77,13 @@ Return ONLY valid JSON, no markdown or explanation.`
 		userPrompt += fmt.Sprintf("\n\nIntended purpose: %s", purpose)
 	}
 
-	resp, err := c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: c.model,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: userPrompt},
-		},
-		Temperature: 0.1,
-	})
+	content, err := c.generateText(ctx, systemPrompt, userPrompt, false)
 	if err != nil {
 		return nil, fmt.Errorf("LLM request failed: %w", err)
 	}
 
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("no response from LLM")
-	}
-
 	var result AnalysisResult
-	content := resp.Choices[0].Message.Content
+	content = extractJSON(content)
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
 		return nil, fmt.Errorf("failed to parse LLM response: %w", err)
 	}
@@ -120,24 +118,13 @@ Return ONLY valid JSON, no markdown.`
 	analysisJSON, _ := json.Marshal(analysis)
 	userPrompt := fmt.Sprintf("Generate container config for this code:\n\n```\n%s\n```\n\nAnalysis:\n%s", code, string(analysisJSON))
 
-	resp, err := c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: c.model,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: userPrompt},
-		},
-		Temperature: 0.1,
-	})
+	content, err := c.generateText(ctx, systemPrompt, userPrompt, false)
 	if err != nil {
 		return nil, fmt.Errorf("LLM request failed: %w", err)
 	}
 
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("no response from LLM")
-	}
-
 	var result SynthesisResult
-	content := resp.Choices[0].Message.Content
+	content = extractJSON(content)
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
 		return nil, fmt.Errorf("failed to parse LLM response: %w", err)
 	}
@@ -184,24 +171,12 @@ Return ONLY valid JSON, no markdown.`
 
 	userPrompt := fmt.Sprintf("Generate Docker configuration for this project:\n\n%s", projectContext)
 
-	resp, err := c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: c.model,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: userPrompt},
-		},
-		Temperature: 0.1,
-	})
+	content, err := c.generateText(ctx, systemPrompt, userPrompt, false)
 	if err != nil {
 		return nil, fmt.Errorf("LLM request failed: %w", err)
 	}
 
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("no response from LLM")
-	}
-
 	var result SynthesisResult
-	content := resp.Choices[0].Message.Content
 
 	// Try to extract JSON from response (handle markdown code blocks)
 	content = extractJSON(content)
@@ -261,27 +236,283 @@ Return ONLY valid JSON, no markdown.`
 	policyJSON, _ := json.Marshal(policy)
 	userPrompt := fmt.Sprintf("Validate this code:\n\n```\n%s\n```\n\nAnalysis:\n%s\n\nPolicy:\n%s", code, string(analysisJSON), string(policyJSON))
 
-	resp, err := c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: c.model,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: userPrompt},
-		},
-		Temperature: 0.1,
-	})
+	content, err := c.generateText(ctx, systemPrompt, userPrompt, false)
 	if err != nil {
 		return nil, fmt.Errorf("LLM request failed: %w", err)
 	}
 
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("no response from LLM")
-	}
-
 	var result ValidationResult
-	content := resp.Choices[0].Message.Content
+	content = extractJSON(content)
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
 		return nil, fmt.Errorf("failed to parse LLM response: %w", err)
 	}
 
 	return &result, nil
+}
+
+func (c *OpenAILLMClient) generateText(ctx context.Context, systemPrompt, userPrompt string, forceJSONObject bool) (string, error) {
+	if isCodexModel(c.model) {
+		content, err := c.createResponses(ctx, systemPrompt, userPrompt)
+		if err == nil {
+			return content, nil
+		}
+
+		// Fallback for providers that expose Codex-like models but don't support /responses.
+		fallbackContent, fallbackErr := c.createCompletion(ctx, systemPrompt, userPrompt)
+		if fallbackErr == nil {
+			return fallbackContent, nil
+		}
+		return "", fmt.Errorf("responses endpoint failed: %w; completions fallback failed: %v", err, fallbackErr)
+	}
+
+	if prefersCompletionsEndpoint(c.model) {
+		content, err := c.createCompletion(ctx, systemPrompt, userPrompt)
+		if err == nil {
+			return content, nil
+		}
+		if shouldFallbackToChatEndpoint(err) && !isStrictCompletionsModel(c.model) {
+			fallbackContent, fallbackErr := c.createChatCompletion(ctx, systemPrompt, userPrompt, forceJSONObject)
+			if fallbackErr == nil {
+				return fallbackContent, nil
+			}
+			return "", fmt.Errorf("completions endpoint failed: %w; chat fallback failed: %v", err, fallbackErr)
+		}
+		return "", err
+	}
+
+	content, err := c.createChatCompletion(ctx, systemPrompt, userPrompt, forceJSONObject)
+	if err == nil {
+		return content, nil
+	}
+	if shouldFallbackToCompletionsEndpoint(err) {
+		fallbackContent, fallbackErr := c.createCompletion(ctx, systemPrompt, userPrompt)
+		if fallbackErr == nil {
+			return fallbackContent, nil
+		}
+		return "", fmt.Errorf("chat endpoint failed: %w; completions fallback failed: %v", err, fallbackErr)
+	}
+	return "", err
+}
+
+func (c *OpenAILLMClient) createResponses(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	reqBody := map[string]interface{}{
+		"model": c.model,
+		"input": formatCompletionPrompt(systemPrompt, userPrompt),
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode responses request: %w", err)
+	}
+
+	baseURL := strings.TrimRight(c.baseURL, "/")
+	if baseURL == "" {
+		baseURL = "https://api.openai.com/v1"
+	}
+	url := baseURL + "/responses"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("failed to create responses request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(c.apiKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("responses request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read responses body: %w", err)
+	}
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
+		msg := parseResponsesErrorMessage(body)
+		return "", fmt.Errorf("error, status code: %d, status: %s, message: %s", resp.StatusCode, resp.Status, msg)
+	}
+
+	var response responsesAPIResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", fmt.Errorf("failed to decode responses payload: %w", err)
+	}
+
+	content := strings.TrimSpace(response.OutputText)
+	if content != "" {
+		return content, nil
+	}
+
+	var chunks []string
+	for _, out := range response.Output {
+		for _, item := range out.Content {
+			text := strings.TrimSpace(item.Text)
+			if text != "" {
+				chunks = append(chunks, text)
+			}
+		}
+	}
+	if len(chunks) > 0 {
+		return strings.Join(chunks, "\n"), nil
+	}
+
+	return "", fmt.Errorf("no response from LLM")
+}
+
+type responsesAPIResponse struct {
+	OutputText string                 `json:"output_text"`
+	Output     []responsesOutputBlock `json:"output"`
+}
+
+type responsesOutputBlock struct {
+	Content []responsesOutputContent `json:"content"`
+}
+
+type responsesOutputContent struct {
+	Text string `json:"text"`
+}
+
+func parseResponsesErrorMessage(body []byte) string {
+	var payload struct {
+		Message string `json:"message"`
+		Error   struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	if err := json.Unmarshal(body, &payload); err == nil {
+		if strings.TrimSpace(payload.Error.Message) != "" {
+			return payload.Error.Message
+		}
+		if strings.TrimSpace(payload.Message) != "" {
+			return payload.Message
+		}
+	}
+
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return "unknown error"
+	}
+	return trimmed
+}
+
+func (c *OpenAILLMClient) createChatCompletion(
+	ctx context.Context,
+	systemPrompt, userPrompt string,
+	forceJSONObject bool,
+) (string, error) {
+	req := openai.ChatCompletionRequest{
+		Model: c.model,
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+			{Role: openai.ChatMessageRoleUser, Content: userPrompt},
+		},
+	}
+	if forceJSONObject {
+		req.ResponseFormat = &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+		}
+	}
+
+	resp, err := c.client.CreateChatCompletion(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("no response from LLM")
+	}
+	return resp.Choices[0].Message.Content, nil
+}
+
+func (c *OpenAILLMClient) createCompletion(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	resp, err := c.client.CreateCompletion(ctx, openai.CompletionRequest{
+		Model:     c.model,
+		Prompt:    formatCompletionPrompt(systemPrompt, userPrompt),
+		MaxTokens: 4000,
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("no response from LLM")
+	}
+	return resp.Choices[0].Text, nil
+}
+
+func formatCompletionPrompt(systemPrompt, userPrompt string) string {
+	parts := make([]string, 0, 3)
+	if strings.TrimSpace(systemPrompt) != "" {
+		parts = append(parts, "System instructions:\n"+strings.TrimSpace(systemPrompt))
+	}
+	parts = append(parts, "User request:\n"+strings.TrimSpace(userPrompt))
+	parts = append(parts, "Assistant response:")
+	return strings.Join(parts, "\n\n")
+}
+
+func prefersCompletionsEndpoint(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(m, "text-") ||
+		strings.Contains(m, "instruct")
+}
+
+func isCodexModel(model string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(model)), "codex")
+}
+
+func isStrictCompletionsModel(model string) bool {
+	return isCodexModel(model)
+}
+
+func shouldFallbackToCompletionsEndpoint(err error) bool {
+	if errors.Is(err, openai.ErrChatCompletionInvalidModel) {
+		return true
+	}
+
+	var apiErr *openai.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+
+	msg := strings.ToLower(apiErr.Message)
+	if strings.Contains(msg, "not a chat model") {
+		return true
+	}
+	if strings.Contains(msg, "v1/chat/completions") && strings.Contains(msg, "v1/completions") {
+		return true
+	}
+	if strings.Contains(msg, "/chat/completions") && strings.Contains(msg, "/completions") {
+		return true
+	}
+	return apiErr.HTTPStatusCode == 404 &&
+		(strings.Contains(msg, "chat/completions") || strings.Contains(msg, "not supported"))
+}
+
+func shouldFallbackToChatEndpoint(err error) bool {
+	if errors.Is(err, openai.ErrCompletionUnsupportedModel) {
+		return true
+	}
+
+	var apiErr *openai.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+
+	msg := strings.ToLower(apiErr.Message)
+	if strings.Contains(msg, "not a completion model") {
+		return true
+	}
+	if strings.Contains(msg, "v1/completions") &&
+		strings.Contains(msg, "v1/chat/completions") &&
+		(strings.Contains(msg, "did you mean") || strings.Contains(msg, "please use")) {
+		return true
+	}
+	if strings.Contains(msg, "/completions") &&
+		strings.Contains(msg, "/chat/completions") &&
+		(strings.Contains(msg, "did you mean") || strings.Contains(msg, "please use")) {
+		return true
+	}
+	return false
 }

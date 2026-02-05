@@ -9,8 +9,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
-	"github.com/sashabaranov/go-openai"
 )
 
 // ReportGenerator generates structured analysis reports
@@ -18,6 +16,9 @@ type ReportGenerator struct {
 	llm    *OpenAILLMClient
 	config ReportConfig
 }
+
+// ReportProgressFn receives live phase progress updates during report generation.
+type ReportProgressFn func(phase int, name string)
 
 // ReportConfig configures report generation
 type ReportConfig struct {
@@ -47,6 +48,16 @@ func NewReportGenerator(llm *OpenAILLMClient, config ReportConfig) *ReportGenera
 
 // GenerateReport generates a comprehensive analysis report
 func (rg *ReportGenerator) GenerateReport(ctx context.Context, code string, opts ReportOptions) (*AnalysisReport, error) {
+	return rg.GenerateReportWithProgress(ctx, code, opts, nil)
+}
+
+// GenerateReportWithProgress generates a report and emits phase progress updates.
+func (rg *ReportGenerator) GenerateReportWithProgress(
+	ctx context.Context,
+	code string,
+	opts ReportOptions,
+	progress ReportProgressFn,
+) (*AnalysisReport, error) {
 	reportID := fmt.Sprintf("report_%d", time.Now().UnixNano())
 	report := NewAnalysisReport(reportID)
 
@@ -54,6 +65,7 @@ func (rg *ReportGenerator) GenerateReport(ctx context.Context, code string, opts
 	report.Input = rg.buildInputMetadata(code, opts)
 
 	// Phase 1: Code structure analysis
+	rg.emitProgress(progress, 1, "Code structure analysis")
 	codeAnalysis, err := rg.analyzeCodeStructure(ctx, code, opts)
 	if err != nil {
 		return nil, fmt.Errorf("code analysis failed: %w", err)
@@ -61,6 +73,7 @@ func (rg *ReportGenerator) GenerateReport(ctx context.Context, code string, opts
 	report.Code = *codeAnalysis
 
 	// Phase 2: Security assessment
+	rg.emitProgress(progress, 2, "Security assessment")
 	securityAssessment, err := rg.analyzeSecurityWithPatterns(ctx, code, codeAnalysis)
 	if err != nil {
 		return nil, fmt.Errorf("security analysis failed: %w", err)
@@ -68,18 +81,28 @@ func (rg *ReportGenerator) GenerateReport(ctx context.Context, code string, opts
 	report.Security = *securityAssessment
 
 	// Phase 3: Capability detection
+	rg.emitProgress(progress, 3, "Capability detection")
 	report.Capabilities = rg.detectCapabilities(code, codeAnalysis)
 
 	// Phase 4: Dependency analysis
+	rg.emitProgress(progress, 4, "Dependency analysis")
 	report.Dependencies = rg.analyzeDependencies(codeAnalysis)
 
 	// Phase 5: Execution recommendations
+	rg.emitProgress(progress, 5, "Generating recommendations")
 	report.Execution = rg.generateExecutionRecommendations(report)
 
 	// Phase 6: Summary
+	rg.emitProgress(progress, 6, "Summary generation")
 	report.Summary = rg.generateSummary(report)
 
 	return report, nil
+}
+
+func (rg *ReportGenerator) emitProgress(progress ReportProgressFn, phase int, name string) {
+	if progress != nil {
+		progress(phase, name)
+	}
 }
 
 // ReportOptions contains options for report generation
@@ -93,12 +116,12 @@ func (rg *ReportGenerator) buildInputMetadata(code string, opts ReportOptions) R
 	lines := strings.Split(code, "\n")
 
 	return ReportInput{
-		SourceType:   "inline",
-		Language:     opts.Language,
-		Purpose:      opts.Purpose,
-		CodeSize:     len(code),
-		LineCount:    len(lines),
-		SHA256:       hex.EncodeToString(hash[:]),
+		SourceType: "inline",
+		Language:   opts.Language,
+		Purpose:    opts.Purpose,
+		CodeSize:   len(code),
+		LineCount:  len(lines),
+		SHA256:     hex.EncodeToString(hash[:]),
 	}
 }
 
@@ -145,26 +168,10 @@ Be precise and thorough. Return ONLY the JSON, no markdown or explanation.`
 		userPrompt += fmt.Sprintf("\n\nStated purpose: %s", opts.Purpose)
 	}
 
-	resp, err := rg.llm.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: rg.llm.model,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: userPrompt},
-		},
-		Temperature: 0.1,
-		ResponseFormat: &openai.ChatCompletionResponseFormat{
-			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
-		},
-	})
+	content, err := rg.llm.generateText(ctx, systemPrompt, userPrompt, true)
 	if err != nil {
 		return nil, fmt.Errorf("LLM request failed: %w", err)
 	}
-
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("no response from LLM")
-	}
-
-	content := resp.Choices[0].Message.Content
 	content = extractJSON(content)
 
 	var result CodeAnalysis
@@ -435,23 +442,11 @@ Return empty array [] if no issues found. Return ONLY the JSON array.`
 
 	userPrompt := fmt.Sprintf("Security analysis for %s code:\n\n```\n%s\n```", codeAnalysis.DetectedLanguage, code)
 
-	resp, err := rg.llm.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: rg.llm.model,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: userPrompt},
-		},
-		Temperature: 0.1,
-	})
+	content, err := rg.llm.generateText(ctx, systemPrompt, userPrompt, false)
 	if err != nil {
 		return nil, err
 	}
-
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("no response")
-	}
-
-	content := extractJSON(resp.Choices[0].Message.Content)
+	content = extractJSON(content)
 
 	var findings []SecurityIssue
 	if err := json.Unmarshal([]byte(content), &findings); err != nil {
@@ -543,7 +538,7 @@ func (rg *ReportGenerator) detectCapabilities(code string, analysis *CodeAnalysi
 		`net\.Dial|http\.Get|http\.Post`,
 	}
 	for _, p := range networkPatterns {
-		if regexp.MustCompile(`(?i)`+p).MatchString(code) {
+		if regexp.MustCompile(`(?i)` + p).MatchString(code) {
 			caps.Network.Required = true
 			caps.Network.Outbound = true
 			caps.Network.Evidence = append(caps.Network.Evidence, p)
@@ -563,12 +558,12 @@ func (rg *ReportGenerator) detectCapabilities(code string, analysis *CodeAnalysi
 	fsWritePatterns := []string{`open\(.*['"][wa]`, `write\(|WriteFile|writeFileSync`}
 
 	for _, p := range fsReadPatterns {
-		if regexp.MustCompile(`(?i)`+p).MatchString(code) {
+		if regexp.MustCompile(`(?i)` + p).MatchString(code) {
 			caps.Filesystem.ReadRequired = true
 		}
 	}
 	for _, p := range fsWritePatterns {
-		if regexp.MustCompile(`(?i)`+p).MatchString(code) {
+		if regexp.MustCompile(`(?i)` + p).MatchString(code) {
 			caps.Filesystem.WriteRequired = true
 		}
 	}
@@ -585,7 +580,7 @@ func (rg *ReportGenerator) detectCapabilities(code string, analysis *CodeAnalysi
 		`Runtime\.exec|ProcessBuilder`,
 	}
 	for _, p := range processPatterns {
-		if regexp.MustCompile(`(?i)`+p).MatchString(code) {
+		if regexp.MustCompile(`(?i)` + p).MatchString(code) {
 			caps.Process.SubprocessRequired = true
 			caps.Process.Evidence = append(caps.Process.Evidence, p)
 		}
