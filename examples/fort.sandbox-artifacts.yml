@@ -1,13 +1,24 @@
-# Demo-oriented override config to capture output artifacts from sandbox runs.
+# Fort Configuration - merged from fort.yml + sandbox artifact tuning
 # Use with: ./fort -config examples/fort.sandbox-artifacts.yml -mode sandbox ...
 #
-# This keeps network disabled, but allows write operations in the sandbox so
-# /app/output artifacts can be produced and later parsed by LLM analysis.
+# This keeps network disabled, allows writes for /app/output artifact capture,
+# and increases limits for richer artifact-heavy runs.
+llm:
+  provider: openai
+  model: gpt-5.2-codex
+  temperature: 0.1
+
+execution:
+  timeout_sec: 90
+  memory_mb: 384
+  cpu_limit: 1.0
+  max_pids: 100
+
 security:
   allow_network: false
   allow_file_write: true
   require_validate: true
 
-execution:
-  timeout_sec: 90
-  memory_mb: 384
+docker:
+  build_timeout: "5m"
+  no_cache: false
